@@ -49,7 +49,6 @@ BASE_PKGS=(
     btrfs-progs e2fsprogs dosfstools
     networkmanager
     vim sudo zsh
-    intel-ucode amd-ucode
     polkit efibootmgr mtools
 )
 
