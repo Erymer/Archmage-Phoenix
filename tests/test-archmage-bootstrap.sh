@@ -17,7 +17,7 @@ IMG_SIZE_MB=2048          # 2G fake "p5" — plenty for root(512M)+var(256M)+hom
 LOOP_DEV=""
 
 LUKS_NAME="archmage-test"
-VG_NAME="volgroup0-test"
+VG_NAME="volgroup0test"
 LUKS_PASS="testpass123"
 
 RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'; CYN='\033[0;36m'; RST='\033[0m'

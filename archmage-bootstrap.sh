@@ -13,18 +13,17 @@
 set -euo pipefail
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
-# TODO: Revisar que estas variables están correctas
+# Production — comment these out when testing with the loop device harness
 LUKS_DEV="/dev/nvme0n1p5"
 LUKS_NAME="archmage"
 VG_NAME="volgroup0"
 EFI_PART="/dev/nvme0n1p4"
 
-# ├─nvme0n1p5                  /dev/nvme0n1p5               120G            crypto_LUKS
-# │ └─archmage                 /dev/mapper/archmage         120G            LVM2_member
-# │   ├─volgroup0-root root    /dev/mapper/volgroup0-root    40G /          btrfs
-# │   ├─volgroup0-var  var     /dev/mapper/volgroup0-var      5G /var       ext4
-# │   └─volgroup0-home home    /dev/mapper/volgroup0-home  74.2G /home      btrfs
-
+# Test — uncomment these and comment out the production block above
+# LUKS_DEV="/dev/loop0"
+# LUKS_NAME="archmage-test"
+# VG_NAME="volgroup0test"
+# EFI_PART=""
 
 LV_ROOT="/dev/mapper/${VG_NAME}-root"
 LV_VAR="/dev/mapper/${VG_NAME}-var"
@@ -33,8 +32,6 @@ LV_HOME="/dev/mapper/${VG_NAME}-home"
 MNT="/mnt"
 
 # BTRFS subvolumes created on root. "@" → /  |  "@snapshots" → /.snapshots
-# TODO: Entender exactamente como funciona los subvolumes y si esta
-# configuración es correcta
 BTRFS_ROOT_SUBVOLS=("@" "@snapshots")
 BTRFS_OPTS="noatime,compress=zstd,space_cache=v2,ssd,discard=async"
 
@@ -42,15 +39,18 @@ BTRFS_OPTS="noatime,compress=zstd,space_cache=v2,ssd,discard=async"
 # Leave empty ("") to auto-detect, or hard-code: "@home", "home", etc.
 HOME_SUBVOL=""
 
-# Base packages. Add your own — ucode (intel-ucode/amd-ucode) goes here too.
-# TODO: Revisar que estos paquetes son los minimos necesarios
+# Base packages. Both ucode packages are included — only the correct one
+# will be loaded at boot based on the CPU detected by mkinitcpio.
 BASE_PKGS=(
     base base-devel
     linux linux-firmware linux-headers
+    linux-lts linux-lts-headers
     lvm2 cryptsetup
     btrfs-progs e2fsprogs dosfstools
     networkmanager
-    vim sudo
+    vim sudo zsh
+    intel-ucode amd-ucode
+    polkit efibootmgr mtools
 )
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -64,9 +64,15 @@ hr()   { echo -e "${YEL}──────────────────�
 # ── PREFLIGHT ─────────────────────────────────────────────────────────────────
 [[ ${EUID} -ne 0 ]] && die "Must be run as root."
 
+# Production: includes pacstrap, genfstab, arch-chroot
 for cmd in cryptsetup vgchange mkfs.btrfs mkfs.ext4 btrfs pacstrap genfstab arch-chroot; do
     command -v "$cmd" &>/dev/null || die "Missing: '${cmd}' — booted into the Arch live ISO?"
 done
+
+# Testing: comment out the loop above and use this instead
+# for cmd in cryptsetup vgchange mkfs.btrfs mkfs.ext4 btrfs; do
+#     command -v "$cmd" &>/dev/null || die "Missing: '${cmd}'"
+# done
 
 # ── STEP 1 — LUKS ─────────────────────────────────────────────────────────────
 hr; log "STEP 1 — LUKS"
@@ -76,6 +82,11 @@ else
     log "Opening ${LUKS_DEV} as '${LUKS_NAME}' ..."
     cryptsetup luksOpen "${LUKS_DEV}" "${LUKS_NAME}"
 fi
+
+# Retrieve UUID here so it's available for crypttab, boot entries, and the
+# DONE summary — even if Steps 10–16 are commented out during testing.
+LUKS_UUID=$(cryptsetup luksUUID "${LUKS_DEV}")
+info "LUKS UUID: ${LUKS_UUID}"
 
 # ── STEP 2 — LVM ──────────────────────────────────────────────────────────────
 hr; log "STEP 2 — LVM"
@@ -182,6 +193,8 @@ else
     info "/home          ← ${LV_HOME}  (top-level)"
 fi
 
+# ── Comment out the EFI mount and Steps 9–16 when using the loop device harness
+
 mkdir -p "${MNT}/boot"
 mount "${EFI_PART}" "${MNT}/boot"
 info "/boot          ← ${EFI_PART}"
@@ -192,36 +205,118 @@ pacstrap -K "${MNT}" "${BASE_PKGS[@]}"
 
 # ── STEP 10 — FSTAB + CRYPTTAB ───────────────────────────────────────────────
 hr; log "STEP 10 — fstab + crypttab"
-
 genfstab -U "${MNT}" >> "${MNT}/etc/fstab"
 info "Written: ${MNT}/etc/fstab"
 
-LUKS_UUID=$(cryptsetup luksUUID "${LUKS_DEV}")
 echo "${LUKS_NAME}  UUID=${LUKS_UUID}  none  luks" >> "${MNT}/etc/crypttab"
 info "Written: ${MNT}/etc/crypttab"
-info "LUKS UUID: ${LUKS_UUID}"
+
+# ── STEP 11 — TIME ZONE ───────────────────────────────────────────────────────
+hr; log "STEP 11 — Time zone"
+arch-chroot "${MNT}" ln -sf /usr/share/zoneinfo/Mexico/General /etc/localtime
+arch-chroot "${MNT}" hwclock --systohc
+info "Time zone set: Mexico/General"
+
+# ── STEP 12 — LOCALE ──────────────────────────────────────────────────────────
+hr; log "STEP 12 — Locale"
+sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' "${MNT}/etc/locale.gen"
+echo "LANG=en_US.UTF-8" > "${MNT}/etc/locale.conf"
+arch-chroot "${MNT}" locale-gen
+info "Locale: en_US.UTF-8"
+
+# ── STEP 13 — HOSTNAME + NETWORK ──────────────────────────────────────────────
+hr; log "STEP 13 — Hostname + network"
+read -rp "  Enter hostname: " HOST_NAME
+echo "${HOST_NAME}" > "${MNT}/etc/hostname"
+cat > "${MNT}/etc/hosts" <<EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${HOST_NAME}.localdomain  ${HOST_NAME}
+EOF
+arch-chroot "${MNT}" systemctl enable NetworkManager
+info "Hostname: ${HOST_NAME}"
+info "NetworkManager enabled"
+
+# ── STEP 14 — MKINITCPIO ──────────────────────────────────────────────────────
+hr; log "STEP 14 — mkinitcpio"
+sed -i -E 's/^HOOKS=\(.+\)/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt lvm2 filesystems fsck)/' \
+    "${MNT}/etc/mkinitcpio.conf"
+arch-chroot "${MNT}" mkinitcpio -P
+info "Initramfs built"
+
+# ── STEP 15 — USERS ───────────────────────────────────────────────────────────
+hr; log "STEP 15 — Users"
+
+# Auto-detect the username from the preserved home directory instead of
+# asking — a typed name that doesn't match the existing directory would
+# leave the new account pointing at an empty home instead of the real data.
+_home_dirs=()
+for d in "${MNT}"/home/*/; do
+    [[ -d "$d" ]] || continue
+    _name=$(basename "$d")
+    [[ "${_name}" == "lost+found" ]] && continue
+    _home_dirs+=("${_name}")
+done
+
+if [[ ${#_home_dirs[@]} -eq 1 ]]; then
+    USERNAME="${_home_dirs[0]}"
+    info "Detected existing home directory: ${USERNAME}"
+    read -rp "  Use '${USERNAME}' as the username? [Y/n] " _confirm_user
+    [[ "${_confirm_user,,}" == "n" ]] && read -rp "  Enter username: " USERNAME
+elif [[ ${#_home_dirs[@]} -gt 1 ]]; then
+    warn "Multiple directories found under /home: ${_home_dirs[*]}"
+    read -rp "  Enter username to use (must match one of the above): " USERNAME
+else
+    warn "No existing directories under /home — this looks like a fresh volume."
+    read -rp "  Enter username: " USERNAME
+fi
+
+# --no-create-home means a missing directory here is NOT created for you —
+# the account would end up with no home at all until you make one manually.
+[[ -d "${MNT}/home/${USERNAME}" ]] || warn "No directory at /home/${USERNAME} — with --no-create-home it won't be auto-created. mkdir it before first login, or the account will have no home."
+
+# TODO a way to confirm that the password was written correctly, like double input 
+read -rsp "  Password for ${USERNAME}: " USER_PASSWD; echo
+read -rsp "  Password for root: " ROOT_PASSWD; echo
+
+# --no-create-home preserves existing data under /home/${USERNAME} from the
+# home LV. The directory itself is not touched. Note: the new user will be
+# assigned UID 1000. If your previous install used a different UID, file
+# ownership will be mismatched — fix with:
+#   chown -R 1000:1000 /mnt/home/${USERNAME}
+arch-chroot "${MNT}" useradd \
+    --no-create-home \
+    --home-dir "/home/${USERNAME}" \
+    --groups wheel \
+    --shell /bin/zsh \
+    "${USERNAME}"
+
+printf '%s:%s\n' "${USERNAME}" "${USER_PASSWD}" | arch-chroot "${MNT}" chpasswd
+printf '%s:%s\n' "root"        "${ROOT_PASSWD}" | arch-chroot "${MNT}" chpasswd
+
+sed -i 's/^# %wheel ALL=(ALL:ALL) NOPASSWD: ALL/%wheel ALL=(ALL:ALL) NOPASSWD: ALL/' \
+    "${MNT}/etc/sudoers"
+info "User '${USERNAME}' created and added to wheel"
+
+# ── STEP 16 — BOOTLOADER (systemd-boot) ───────────────────────────────────────
+hr; log "STEP 16 — systemd-boot"
+# /boot is mounted but never formatted — existing loader.conf and boot entries
+# survive intact. The LUKS UUID and LV paths are unchanged, so no entries need
+# rewriting. Only update the EFI binary in case the freshly installed systemd
+# package is newer than what's currently in /boot/EFI/.
+arch-chroot "${MNT}" bootctl update
+info "systemd-boot EFI binary updated"
 
 # ── DONE ──────────────────────────────────────────────────────────────────────
 hr
 echo
-echo -e "${GRN}  Bootstrap complete. System is ready for chroot configuration.${RST}"
+echo -e "${GRN}  Bootstrap complete!${RST}"
 echo
-echo -e "  ${YEL}Chroot checklist:${RST}"
-echo -e "    1.  locale-gen, /etc/locale.conf, /etc/hostname, /etc/hosts"
-echo -e "    2.  ln -sf /usr/share/zoneinfo/<Region>/<City> /etc/localtime && hwclock --systohc"
-echo -e "    3.  passwd  |  useradd -mG wheel <user>  |  visudo"
-echo -e "    4.  Add ucode: pacman -S intel-ucode  OR  amd-ucode"
-echo -e "    5.  mkinitcpio.conf — HOOKS must include 'encrypt' and 'lvm2':"
-echo -e "          HOOKS=(base udev autodetect modconf block encrypt lvm2 filesystems fsck)"
-echo -e "        Then run: mkinitcpio -P"
-echo -e "    6.  GRUB — append to GRUB_CMDLINE_LINUX in /etc/default/grub:"
-echo -e "          cryptdevice=UUID=${LUKS_UUID}:${LUKS_NAME} root=${LV_ROOT}"
-echo -e "        Then: grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=ARCH"
-echo -e "              grub-mkconfig -o /boot/grub/grub.cfg"
-echo -e "        (or: bootctl install  if using systemd-boot)"
+echo -e "  ${YEL}Verify before rebooting:${RST}"
+echo -e "    cat ${MNT}/boot/loader/entries/arch.conf   ← check UUID + root path"
+echo -e "    cat ${MNT}/etc/fstab                        ← check all mount points"
+echo -e "    cat ${MNT}/etc/crypttab                     ← check LUKS UUID"
+echo -e "    ls  ${MNT}/home/${USERNAME:-<user>}/         ← confirm home data survived"
 echo
-read -rp "  Drop into arch-chroot /mnt now? [y/N] " _chroot
+echo -e "  ${YEL}When satisfied:${RST}  umount -R ${MNT} && reboot"
 echo
-if [[ "${_chroot,,}" == "y" ]]; then
-    arch-chroot "${MNT}"
-fi
